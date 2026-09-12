@@ -125,7 +125,79 @@ def main():
     check("整批提前时差异按纸序全部标出",
           status == 200 and body["mismatch_sheets"] == [2, 3, 4])
 
-    print("[4] 递减 + 废张后续印原号")
+    print("[4] 核对区间：跨废张与换号点，号码承接且差异用绝对纸序")
+    # 计划完整轨迹：1:000001(1/2) 2:000001(2/2) 3:000002(1/2) 4:SPOIL 5:000002(2/2) 6:000003(1/2)
+    range_plan = {"start": "000001", "direction": "asc", "copies": 2,
+                  "sheet_count": 6, "spoil_sheets": [4]}
+    full = independent_trajectory(1, "asc", 2, 6, [4])
+
+    # 区间 3~5：从换号点开始、跨废张，首行期望与印次进度承接前序纸张
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 3, "check_to": 5,
+        "actuals": ["000002", "SPOIL", "000002"]})
+    want = [(r["sheet_no"], r["expected"]) for r in full[2:5]]
+    got = [(r["sheet_no"], r["expected"]) for r in body["rows"]]
+    check("区间 3~5 期望轨迹与独立推算切片一致且核对通过",
+          status == 200 and body["all_match"] is True and got == want
+          and [r["impression"] for r in body["rows"]] == ["1/2", "—", "2/2"],
+          json.dumps(body, ensure_ascii=False))
+    check("区间回显为 3~5",
+          body["check_from"] == 3 and body["check_to"] == 5)
+
+    # 区间 4~6：从废张开始，换号仍推迟到第 6 张，而不是从区间起点重新起算
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 4, "check_to": 6,
+        "actuals": ["SPOIL", "000002", "000003"]})
+    check("区间从废张开始时首行期望 SPOIL 且后续按原号码续印",
+          status == 200 and body["all_match"] is True
+          and [r["expected"] for r in body["rows"]] == ["SPOIL", "000002", "000003"]
+          and body["rows"][2]["impression"] == "1/2")
+
+    # 区间 2~3：从同号中段开始，印次进度承接（第 2 张为 2/2）
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 2, "check_to": 3,
+        "actuals": ["000001", "000002"]})
+    check("区间从同号中段开始时印次进度承接",
+          status == 200 and body["all_match"] is True
+          and body["rows"][0]["impression"] == "2/2")
+
+    # 区间 3~5 内第 5 张出错：差异必须报计划中的绝对纸序 5
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 3, "check_to": 5,
+        "actuals": ["000002", "SPOIL", "000009"]})
+    check("区间内差异使用计划中的绝对纸序",
+          status == 200 and body["first_mismatch_sheet"] == 5
+          and body["mismatch_sheets"] == [5])
+
+    print("[5] 非法区间整单拒绝，不产生可误认的局部结果")
+    for name, extra in (
+        ("起始纸序超出计划", {"check_from": 0, "check_to": 3,
+                            "actuals": ["000001", "000001", "000002"]}),
+        ("结束纸序超出计划", {"check_from": 2, "check_to": 7,
+                            "actuals": ["000001"] * 6}),
+        ("起止前后倒置", {"check_from": 5, "check_to": 3,
+                        "actuals": ["000002", "SPOIL", "000002"]}),
+        ("实测数量不等于区间长度", {"check_from": 3, "check_to": 5,
+                                "actuals": ["000002", "SPOIL"]}),
+    ):
+        status, body = request("POST", f"{BACKEND}/api/verify",
+                               {**range_plan, **extra})
+        check(f"{name}：400 且无 rows",
+              status == 400 and "rows" not in body and "error" in body,
+              json.dumps(body, ensure_ascii=False))
+
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 0, "check_to": 3,
+        "actuals": ["000001", "000001", "000002"]})
+    check("起始纸序越界时 field 定位到 check_from",
+          status == 400 and body["field"] == "check_from")
+    status, body = request("POST", f"{BACKEND}/api/verify", {
+        **range_plan, "check_from": 3, "check_to": 5,
+        "actuals": ["000002", "SPOIL"]})
+    check("实测数量不符时 field 定位到 actuals",
+          status == 400 and body["field"] == "actuals")
+
+    print("[6] 递减 + 废张后续印原号")
     status, body = request("POST", f"{BACKEND}/api/verify", {
         "start": "000010", "direction": "desc", "copies": 2,
         "sheet_count": 4, "spoil_sheets": [3],
@@ -133,7 +205,7 @@ def main():
     check("废张后按原号码续印且核对通过",
           status == 200 and body["all_match"] is True)
 
-    print("[5] 废张行写号码 / 普通行写 SPOIL 均判不匹配")
+    print("[7] 废张行写号码 / 普通行写 SPOIL 均判不匹配")
     status, body = request("POST", f"{BACKEND}/api/verify", {
         "start": "000001", "direction": "asc", "copies": 2,
         "sheet_count": 3, "spoil_sheets": [2],
@@ -150,7 +222,7 @@ def main():
     check("普通行写 SPOIL 判不匹配",
           status == 200 and body["rows"][1]["match"] is False)
 
-    print("[6] 越过 999999 / 000000 整单拒绝且无部分轨迹")
+    print("[8] 越过 999999 / 000000 整单拒绝且无部分轨迹")
     status, body = request("POST", f"{BACKEND}/api/generate", {
         "start": "999999", "direction": "asc", "copies": 1,
         "sheet_count": 2, "spoil_sheets": []})
@@ -162,7 +234,7 @@ def main():
         "sheet_count": 2, "spoil_sheets": []})
     check("递减越界返回 400", status == 400 and "rows" not in body)
 
-    print("[7] 错误反馈：实测行数、废张序、非法值")
+    print("[9] 错误反馈：实测行数、废张序、非法值")
     status, body = request("POST", f"{BACKEND}/api/verify", {
         "start": "000001", "direction": "asc", "copies": 1,
         "sheet_count": 3, "spoil_sheets": [], "actuals": ["000001"]})
@@ -186,7 +258,7 @@ def main():
         "actuals": ["1", "000002"]})
     check("非法实测值被拒", status == 400 and body["field"] == "actuals")
 
-    print("[8] 恰好落在边界允许")
+    print("[10] 恰好落在边界允许")
     status, body = request("POST", f"{BACKEND}/api/generate", {
         "start": "999998", "direction": "asc", "copies": 1,
         "sheet_count": 2, "spoil_sheets": []})

@@ -74,6 +74,8 @@ class VerifyResult:
     rows: tuple[ActualRow, ...]
     all_match: bool
     mismatch_sheets: tuple[int, ...]
+    check_from: int             # 核对起始纸序（1-based，闭区间）
+    check_to: int               # 核对结束纸序（1-based，闭区间）
 
 
 def _as_int(value: Any, field: str, label: str) -> int:
@@ -208,6 +210,37 @@ def build_trajectory(plan: Plan) -> tuple[ExpectedRow, ...]:
     return tuple(rows)
 
 
+def normalize_check_range(
+    check_from: Any,
+    check_to: Any,
+    sheet_count: int,
+) -> tuple[int, int]:
+    """归一化核对区间（1-based 闭区间）。
+
+    未传的一端取计划边界（起始默认 1、结束默认 sheet_count），
+    因此未传区间的旧请求等价于覆盖完整计划。
+    """
+    lo = 1 if check_from is None else _as_int(check_from, "check_from", "核对起始纸序")
+    hi = (
+        sheet_count
+        if check_to is None
+        else _as_int(check_to, "check_to", "核对结束纸序")
+    )
+    if not 1 <= lo <= sheet_count:
+        raise PlanError(
+            f"核对起始纸序 {lo} 超出计划范围（1~{sheet_count}）。", "check_from"
+        )
+    if not 1 <= hi <= sheet_count:
+        raise PlanError(
+            f"核对结束纸序 {hi} 超出计划范围（1~{sheet_count}）。", "check_to"
+        )
+    if lo > hi:
+        raise PlanError(
+            f"核对起始纸序 {lo} 不能大于核对结束纸序 {hi}。", "check_from"
+        )
+    return lo, hi
+
+
 def _normalize_actual(raw: Any) -> str:
     if not isinstance(raw, str):
         raise PlanError("每张实测值必须是字符串（六位号码或 SPOIL）。", "actuals")
@@ -227,22 +260,38 @@ def verify_plan(
     sheet_count: Any,
     spoil_sheets: Any,
     actuals: Any,
+    check_from: Any = None,
+    check_to: Any = None,
 ) -> VerifyResult:
-    """生成轨迹并与逐张实测核对。任何错误都整单拒绝（不返回部分轨迹）。"""
+    """生成轨迹并与逐张实测核对。任何错误都整单拒绝（不返回部分轨迹）。
+
+    先按完整计划推进号码与有效印次，再截取 ``[check_from, check_to]``
+    闭区间参与实测比对；因此区间从废张、同号中段或换号点开始时，
+    首行期望与印次进度都承接前序纸张，而不是重新起算。
+    未传区间时默认覆盖完整计划，行为与旧请求一致。
+    """
     plan = normalize_plan(start, direction, copies, sheet_count, spoil_sheets)
+    lo, hi = normalize_check_range(check_from, check_to, plan.sheet_count)
 
     if not isinstance(actuals, list):
         raise PlanError("实测记录必须是数组。", "actuals")
-    if len(actuals) != plan.sheet_count:
+    expected_count = hi - lo + 1
+    if len(actuals) != expected_count:
+        if lo == 1 and hi == plan.sheet_count:
+            raise PlanError(
+                f"实测行数为 {len(actuals)}，必须等于计划张数 {plan.sheet_count}。",
+                "actuals",
+            )
         raise PlanError(
-            f"实测行数为 {len(actuals)}，必须等于计划张数 {plan.sheet_count}。",
+            f"实测行数为 {len(actuals)}，必须等于核对区间长度 "
+            f"{expected_count}（第 {lo}~{hi} 张）。",
             "actuals",
         )
 
     normalized_actuals = [_normalize_actual(item) for item in actuals]
 
     # 参数与实测全部通过校验后才生成轨迹，确保越界时绝不返回部分轨迹
-    expected_rows = build_trajectory(plan)
+    expected_rows = build_trajectory(plan)[lo - 1 : hi]
 
     result_rows: list[ActualRow] = []
     mismatch_sheets: list[int] = []
@@ -275,4 +324,6 @@ def verify_plan(
         rows=tuple(result_rows),
         all_match=not mismatch_sheets,
         mismatch_sheets=tuple(mismatch_sheets),
+        check_from=lo,
+        check_to=hi,
     )

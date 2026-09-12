@@ -6,6 +6,7 @@ import pytest
 from .trajectory import (
     PlanError,
     build_trajectory,
+    normalize_check_range,
     normalize_plan,
     verify_plan,
 )
@@ -228,3 +229,111 @@ def test_overflow_rejected_without_partial_trajectory():
     # 越界时整单拒绝，即便实测本身格式合法
     with pytest.raises(PlanError):
         verify_plan("999999", "asc", 1, 2, [], ["999999", "000000"])
+
+
+# ---------- 核对区间（check_from / check_to） ----------
+#
+# 计划：起号 000001、递增、每号 2 次、6 张、第 4 张废张
+# 完整轨迹：1:000001(1/2) 2:000001(2/2) 3:000002(1/2) 4:SPOIL 5:000002(2/2) 6:000003(1/2)
+RANGE_PLAN = dict(
+    start="000001", direction="asc", copies=2, sheet_count=6, spoil_sheets=[4]
+)
+
+
+def test_range_defaults_to_full_plan():
+    result = verify_plan(
+        **RANGE_PLAN,
+        actuals=["000001", "000001", "000002", "SPOIL", "000002", "000003"],
+    )
+    assert (result.check_from, result.check_to) == (1, 6)
+    assert [r.sheet_no for r in result.rows] == [1, 2, 3, 4, 5, 6]
+    assert result.all_match is True
+
+
+def test_range_partial_fields_fill_plan_bounds():
+    assert normalize_check_range(None, None, 6) == (1, 6)
+    assert normalize_check_range(3, None, 6) == (3, 6)
+    assert normalize_check_range(None, 4, 6) == (1, 4)
+
+
+def test_range_starting_at_number_change_point_carries_progress():
+    # 区间 3~5 从换号点开始、跨废张：首行承接 000002 的 1/2，废张后仍是 2/2
+    result = verify_plan(
+        **RANGE_PLAN, check_from=3, check_to=5,
+        actuals=["000002", "SPOIL", "000002"],
+    )
+    assert result.all_match is True
+    assert [(r.sheet_no, r.expected, r.impression) for r in result.rows] == [
+        (3, "000002", "1/2"),
+        (4, "SPOIL", "—"),
+        (5, "000002", "2/2"),
+    ]
+
+
+def test_range_starting_at_spoil_sheet_keeps_continuation():
+    # 区间 4~6 从废张开始：首行期望 SPOIL，换号推迟到第 6 张而非重新起算
+    result = verify_plan(
+        **RANGE_PLAN, check_from=4, check_to=6,
+        actuals=["SPOIL", "000002", "000003"],
+    )
+    assert result.all_match is True
+    assert [(r.sheet_no, r.expected, r.impression) for r in result.rows] == [
+        (4, "SPOIL", "—"),
+        (5, "000002", "2/2"),
+        (6, "000003", "1/2"),
+    ]
+
+
+def test_range_starting_mid_number_keeps_impression_progress():
+    # 区间 2~3 从同号中段开始：第 2 张是 000001 的第 2 印次，而非重新计 1/2
+    result = verify_plan(
+        **RANGE_PLAN, check_from=2, check_to=3,
+        actuals=["000001", "000002"],
+    )
+    assert result.all_match is True
+    assert [(r.sheet_no, r.impression) for r in result.rows] == [(2, "2/2"), (3, "1/2")]
+
+
+def test_range_mismatch_uses_absolute_sheet_no():
+    result = verify_plan(
+        **RANGE_PLAN, check_from=3, check_to=5,
+        actuals=["000002", "SPOIL", "000009"],
+    )
+    assert result.all_match is False
+    assert result.mismatch_sheets == (5,)  # 计划中的绝对纸序，而非区间内第 3 张
+    assert result.rows[2].sheet_no == 5
+    assert "000002" in result.rows[2].mismatch_reason
+
+
+@pytest.mark.parametrize(
+    ("check_from", "check_to", "field"),
+    [
+        (0, 3, "check_from"),      # 起始超出计划
+        (7, 7, "check_from"),      # 起始超出计划
+        (2, 7, "check_to"),        # 结束超出计划
+        (5, 3, "check_from"),      # 前后倒置
+        ("3", 5, "check_from"),    # 非整数类型
+        (2, 2.5, "check_to"),
+        (True, 3, "check_from"),
+    ],
+)
+def test_invalid_range_rejected_with_field(check_from, check_to, field):
+    with pytest.raises(PlanError) as excinfo:
+        verify_plan(
+            **RANGE_PLAN, check_from=check_from, check_to=check_to,
+            actuals=["000001"],
+        )
+    assert excinfo.value.field == field
+
+
+def test_range_actuals_count_must_match_range_length():
+    with pytest.raises(PlanError, match="核对区间长度 3") as excinfo:
+        verify_plan(
+            **RANGE_PLAN, check_from=3, check_to=5,
+            actuals=["000002", "SPOIL"],  # 只有 2 条，区间长度为 3
+        )
+    assert excinfo.value.field == "actuals"
+
+    # 全程区间保持原有错误文案
+    with pytest.raises(PlanError, match="计划张数 6"):
+        verify_plan(**RANGE_PLAN, actuals=["000001"])

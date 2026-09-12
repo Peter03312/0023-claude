@@ -7,6 +7,8 @@ const form = reactive({
   copies: 1,
   sheetCount: 10,
   spoilText: '',
+  checkFrom: '',
+  checkTo: '',
 })
 
 const actuals = ref([])
@@ -18,6 +20,18 @@ const result = ref(null)
 const spoilSet = computed(() => new Set(parsedSpoils.value))
 const parsedSpoils = ref([])
 
+// 后端 field（snake_case）到表单字段的映射，用于把拒绝原因落到对应输入处
+const FIELD_KEY_MAP = {
+  start: 'start',
+  direction: 'direction',
+  copies: 'copies',
+  sheet_count: 'sheetCount',
+  spoil_sheets: 'spoilText',
+  check_from: 'checkFrom',
+  check_to: 'checkTo',
+  actuals: 'actuals',
+}
+
 function parseSpoils() {
   const text = form.spoilText.trim()
   if (!text) return []
@@ -27,17 +41,32 @@ function parseSpoils() {
     .map((token) => Number(token))
 }
 
-function isPlannedSpoil(index) {
-  return spoilSet.value.has(index + 1)
+// 核对区间（闭区间，纸序为计划中的绝对序号）；留空表示覆盖计划全程
+const rangeInfo = computed(() => {
+  const n = Number(form.sheetCount)
+  const from = form.checkFrom === '' ? 1 : Number(form.checkFrom)
+  const to = form.checkTo === '' ? n : Number(form.checkTo)
+  const valid =
+    Number.isInteger(n) && n >= 1 && n <= 200 &&
+    Number.isInteger(from) && Number.isInteger(to) &&
+    from >= 1 && to <= n && from <= to
+  return { from, to, length: valid ? to - from + 1 : 0, valid }
+})
+
+// 区间非法时实测区仍按第 1 张起标注，避免显示 NaN
+const displayFrom = computed(() => (rangeInfo.value.valid ? rangeInfo.value.from : 1))
+
+function isPlannedSpoil(sheetNo) {
+  return spoilSet.value.has(sheetNo)
 }
 
-// 纸张数变化时同步实测行数；计划废张行自动预填 SPOIL（可手动覆盖）
+// 纸张数或核对区间变化时同步实测行数；计划废张行自动预填 SPOIL（可手动覆盖）
 function syncActuals() {
-  const n = Number(form.sheetCount)
-  if (!Number.isInteger(n) || n < 1 || n > 200) return
-  const next = actuals.value.slice(0, n)
-  for (let i = next.length; i < n; i++) {
-    next.push(isPlannedSpoil(i) ? 'SPOIL' : '')
+  const info = rangeInfo.value
+  if (!info.valid) return
+  const next = actuals.value.slice(0, info.length)
+  for (let i = next.length; i < info.length; i++) {
+    next.push(isPlannedSpoil(info.from + i) ? 'SPOIL' : '')
   }
   actuals.value = next
 }
@@ -45,7 +74,7 @@ function syncActuals() {
 function onSpoilTextChange() {
   parsedSpoils.value = parseSpoils()
   for (let i = 0; i < actuals.value.length; i++) {
-    if (isPlannedSpoil(i) && actuals.value[i].trim() === '') {
+    if (isPlannedSpoil(displayFrom.value + i) && actuals.value[i].trim() === '') {
       actuals.value[i] = 'SPOIL'
     }
   }
@@ -96,8 +125,22 @@ function validateLocally() {
     fieldErrors.spoilText = '全部纸张都是废张，无法形成号码轨迹。'
   }
 
-  if (actuals.value.length !== n) {
-    formError.value = `实测行数（${actuals.value.length}）与计划张数（${n}）不一致。`
+  // 核对区间：留空默认覆盖全程；填写则须为计划范围内的整数且起不晚于止
+  const fromVal = form.checkFrom === '' ? 1 : Number(form.checkFrom)
+  const toVal = form.checkTo === '' ? n : Number(form.checkTo)
+  const nValid = Number.isInteger(n) && n >= 1 && n <= 200
+  if (!Number.isInteger(fromVal) || fromVal < 1 || (nValid && fromVal > n)) {
+    fieldErrors.checkFrom = `核对起始纸序须为 1~${nValid ? n : 200} 的整数（留空默认第 1 张）。`
+  }
+  if (!Number.isInteger(toVal) || toVal < 1 || (nValid && toVal > n)) {
+    fieldErrors.checkTo = `核对结束纸序须为 1~${nValid ? n : 200} 的整数（留空默认第 ${nValid ? n : '末'} 张）。`
+  }
+  if (!fieldErrors.checkFrom && !fieldErrors.checkTo && fromVal > toVal) {
+    fieldErrors.checkFrom = '核对起始纸序不能大于核对结束纸序。'
+  }
+
+  if (rangeInfo.value.valid && actuals.value.length !== rangeInfo.value.length) {
+    formError.value = `实测行数（${actuals.value.length}）与核对区间长度（${rangeInfo.value.length}）不一致。`
   }
 
   return Object.keys(fieldErrors).length === 0 && !formError.value
@@ -113,6 +156,8 @@ async function submit() {
     copies: Number(form.copies),
     sheet_count: Number(form.sheetCount),
     spoil_sheets: parseSpoils(),
+    check_from: rangeInfo.value.from,
+    check_to: rangeInfo.value.to,
     actuals: actuals.value.map((v) => v.trim()),
   }
 
@@ -125,8 +170,10 @@ async function submit() {
     })
     const body = await resp.json()
     if (!resp.ok) {
-      if (body.field && body.field !== 'plan' && body.field !== 'actuals') {
-        fieldErrors[body.field] = body.error
+      // 后端 field 落到对应输入处；当前录入内容保留，便于修正后重提
+      const key = body.field && FIELD_KEY_MAP[body.field]
+      if (key) {
+        fieldErrors[key] = body.error
       } else {
         formError.value = body.error || '请求被拒绝。'
       }
@@ -201,15 +248,38 @@ syncActuals()
     </section>
 
     <section class="card">
-      <h2>2. 逐张实测（六位号码或 SPOIL）</h2>
-      <div class="actual-grid">
-        <label v-for="(_, i) in actuals" :key="i" class="actual-cell"
-               :class="{ spoil: isPlannedSpoil(i) }">
-          <span class="sheet-tag">第 {{ i + 1 }} 张<template v-if="isPlannedSpoil(i)"> · 废</template></span>
-          <input v-model="actuals[i]" :aria-label="`第 ${i + 1} 张实测`"
-                 :placeholder="isPlannedSpoil(i) ? 'SPOIL' : '000000'" />
+      <h2>2. 核对区间与逐张实测（六位号码或 SPOIL）</h2>
+      <div class="grid">
+        <label>
+          核对起始纸序（留空默认第 1 张）
+          <input v-model="form.checkFrom" type="number" min="1" :max="form.sheetCount"
+                 :class="{ bad: fieldErrors.checkFrom }" placeholder="1"
+                 @change="syncActuals" />
+          <span v-if="fieldErrors.checkFrom" class="err">{{ fieldErrors.checkFrom }}</span>
+        </label>
+
+        <label>
+          核对结束纸序（留空默认第 {{ form.sheetCount }} 张）
+          <input v-model="form.checkTo" type="number" min="1" :max="form.sheetCount"
+                 :class="{ bad: fieldErrors.checkTo }" :placeholder="String(form.sheetCount)"
+                 @change="syncActuals" />
+          <span v-if="fieldErrors.checkTo" class="err">{{ fieldErrors.checkTo }}</span>
         </label>
       </div>
+      <p v-if="rangeInfo.valid" class="hint range-hint">
+        本次核对第 {{ rangeInfo.from }} ~ {{ rangeInfo.to }} 张，共 {{ rangeInfo.length }} 张；
+        请按此区间逐张录入实测，结果纸序为计划中的绝对序号。
+      </p>
+      <div class="actual-grid">
+        <label v-for="(_, i) in actuals" :key="i" class="actual-cell"
+               :class="{ spoil: isPlannedSpoil(displayFrom + i) }">
+          <span class="sheet-tag">第 {{ displayFrom + i }} 张<template v-if="isPlannedSpoil(displayFrom + i)"> · 废</template></span>
+          <input v-model="actuals[i]" :aria-label="`第 ${displayFrom + i} 张实测`"
+                 :class="{ bad: fieldErrors.actuals }"
+                 :placeholder="isPlannedSpoil(displayFrom + i) ? 'SPOIL' : '000000'" />
+        </label>
+      </div>
+      <span v-if="fieldErrors.actuals" class="err">{{ fieldErrors.actuals }}</span>
     </section>
 
     <div class="actions">
@@ -221,6 +291,10 @@ syncActuals()
 
     <section v-if="result" class="card result">
       <h2>3. 核对结果</h2>
+      <p class="hint range-hint">
+        核对区间：第 {{ result.check_from }} ~ {{ result.check_to }} 张
+        （纸序为计划中的绝对序号）。
+      </p>
       <div :class="result.all_match ? 'banner ok' : 'banner fail'">
         <template v-if="result.all_match">
           ✅ 全部 {{ result.rows.length }} 张一致，轨迹无误。

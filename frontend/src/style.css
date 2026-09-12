@@ -112,6 +112,11 @@ input.bad {
   font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
 }
 
+.range-hint {
+  margin: 12px 0 10px;
+  font-size: 13px;
+}
+
 .actions {
   margin-top: 18px;
   display: flex;

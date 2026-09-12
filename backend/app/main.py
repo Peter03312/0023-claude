@@ -101,7 +101,12 @@ async def verify(request: Request) -> dict[str, Any]:
         )
 
     fields = _extract_plan_fields(payload)
-    result = verify_plan(actuals=payload["actuals"], **fields)
+    result = verify_plan(
+        actuals=payload["actuals"],
+        check_from=payload.get("check_from"),
+        check_to=payload.get("check_to"),
+        **fields,
+    )
 
     return {
         "plan": {
@@ -111,6 +116,8 @@ async def verify(request: Request) -> dict[str, Any]:
             "sheet_count": result.plan.sheet_count,
             "spoil_sheets": list(result.plan.spoil_sheets),
         },
+        "check_from": result.check_from,
+        "check_to": result.check_to,
         "all_match": result.all_match,
         "mismatch_sheets": list(result.mismatch_sheets),
         "first_mismatch_sheet": (

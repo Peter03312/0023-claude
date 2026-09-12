@@ -138,3 +138,130 @@ def test_malformed_json_body():
     )
     assert resp.status_code == 400
     assert resp.json()["field"] == "plan"
+
+
+# ---------- 核对区间（check_from / check_to） ----------
+
+RANGE_PLAN = {
+    "start": "000001",
+    "direction": "asc",
+    "copies": 2,
+    "sheet_count": 6,
+    "spoil_sheets": [4],
+}
+# 完整轨迹：1:000001(1/2) 2:000001(2/2) 3:000002(1/2) 4:SPOIL 5:000002(2/2) 6:000003(1/2)
+
+
+def test_verify_without_range_keeps_legacy_behavior():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "actuals": ["000001", "000001", "000002", "SPOIL", "000002", "000003"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_match"] is True
+    assert body["check_from"] == 1 and body["check_to"] == 6
+    assert [r["sheet_no"] for r in body["rows"]] == [1, 2, 3, 4, 5, 6]
+
+
+def test_verify_range_across_spoil_and_number_change():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "check_from": 3,
+            "check_to": 5,
+            "actuals": ["000002", "SPOIL", "000002"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_match"] is True
+    assert (body["check_from"], body["check_to"]) == (3, 5)
+    assert [
+        (r["sheet_no"], r["expected"], r["impression"]) for r in body["rows"]
+    ] == [(3, "000002", "1/2"), (4, "SPOIL", "—"), (5, "000002", "2/2")]
+
+
+def test_verify_range_from_spoil_start_continues_trajectory():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "check_from": 4,
+            "check_to": 6,
+            "actuals": ["SPOIL", "000002", "000003"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["all_match"] is True
+    assert [r["expected"] for r in body["rows"]] == ["SPOIL", "000002", "000003"]
+
+
+def test_verify_range_mismatch_reports_absolute_sheet_no():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "check_from": 3,
+            "check_to": 5,
+            "actuals": ["000002", "SPOIL", "000009"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["first_mismatch_sheet"] == 5
+    assert body["mismatch_sheets"] == [5]
+
+
+def test_verify_range_out_of_plan_rejected_without_rows():
+    resp = client.post(
+        "/api/verify",
+        json={**RANGE_PLAN, "check_from": 0, "check_to": 3, "actuals": ["000001"]},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["field"] == "check_from" and "rows" not in body
+
+    resp = client.post(
+        "/api/verify",
+        json={**RANGE_PLAN, "check_from": 2, "check_to": 7, "actuals": ["000001"]},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["field"] == "check_to" and "rows" not in body
+
+
+def test_verify_inverted_range_rejected_without_rows():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "check_from": 5,
+            "check_to": 3,
+            "actuals": ["000002", "SPOIL", "000002"],
+        },
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["field"] == "check_from" and "rows" not in body
+
+
+def test_verify_range_actuals_count_mismatch_rejected():
+    resp = client.post(
+        "/api/verify",
+        json={
+            **RANGE_PLAN,
+            "check_from": 3,
+            "check_to": 5,
+            "actuals": ["000002", "SPOIL"],  # 区间长度 3，实测只有 2 条
+        },
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["field"] == "actuals" and "rows" not in body
+    assert "核对区间长度 3" in body["error"]
