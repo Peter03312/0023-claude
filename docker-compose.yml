@@ -4,10 +4,12 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status == 200 else 1)"]
+      # 显式用 IPv4 字面量，避免 localhost 解析到 ::1 带来的歧义
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 5s
 
   frontend:
     build: ./frontend
@@ -17,17 +19,23 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:80/"]
+      # 必须用 127.0.0.1，不能用 localhost：
+      # alpine 的 busybox wget 在 getaddrinfo 返回多个地址时只连接第一个、
+      # 失败不回退；若 localhost 优先解析到 ::1（而 nginx 仅监听 IPv4 的 80），
+      # 该检查会一直 connection refused，导致容器永不 healthy。
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80/"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 5s
 
-  # 一次性验收服务：对 frontend/backend 做真实 HTTP 联调，成功退出 0 后容器结束
+  # 一次性验收服务：对 frontend/backend 做真实 HTTP 联调，成功退出 0 后容器结束。
+  # 只等容器启动，就绪轮询交给脚本内的 wait_for_services，避免验收被健康检查条件卡死。
   verify:
     build: ./verify
     depends_on:
       backend:
-        condition: service_healthy
+        condition: service_started
       frontend:
-        condition: service_healthy
+        condition: service_started
     restart: "no"
